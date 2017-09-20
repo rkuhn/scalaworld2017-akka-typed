@@ -41,19 +41,21 @@ object Resource {
  */
 
 sealed trait ResourceOp
-case class GetSession(replyTo: ActorRef[SessionReply]) extends ResourceOp
-case class SingleRead(item: String, replyTo: ActorRef[Either[String, OpReply]]) extends ResourceOp
+final case class GetSession(replyTo: ActorRef[SessionReply]) extends ResourceOp
+final case class SingleRead(item: String, replyTo: ActorRef[OpReply]) extends ResourceOp
 
 sealed trait SessionReply
-case class SessionGranted(session: ActorRef[SessionOp]) extends SessionReply
-case class SessionDenied(errorMessage: String) extends SessionReply
+final case class SessionGranted(session: ActorRef[SessionOp]) extends SessionReply
+final case class SessionDenied(errorMessage: String) extends SessionReply
 
 sealed trait SessionOp
-case class Read(item: String, replyTo: ActorRef[Either[String, OpReply]]) extends SessionOp
-case class Write(item: String, value: BigDecimal, replyTo: ActorRef[Either[String, OpReply]]) extends SessionOp
-case class EndSession(replyTo: ActorRef[SessionEnded.type]) extends SessionOp
+final case class Read(item: String, replyTo: ActorRef[OpReply]) extends SessionOp
+final case class Write(item: String, value: BigDecimal, replyTo: ActorRef[OpReply]) extends SessionOp
+final case class EndSession(replyTo: ActorRef[SessionEnded.type]) extends SessionOp
 
-case class OpReply(item: String, value: BigDecimal)
+sealed trait OpReply
+final case class OpDone(item: String, value: BigDecimal) extends OpReply
+final case class OpFailed(msg: String) extends OpReply
 case object SessionEnded
 
 /*
@@ -67,7 +69,7 @@ object ResourceActor {
   def initial(res: Res) = idle(res, Map.empty, 0)
 
   private case class SessionWrapper(snr: Int, op: SessionOp) extends ResourceOp
-  private case class Result(result: Either[String, OpReply], snr: Int, replyTo: ActorRef[Either[String, OpReply]]) extends ResourceOp
+  private case class Result(result: OpReply, snr: Int, replyTo: ActorRef[OpReply]) extends ResourceOp
 
   private def idle(res: Res, cache: Cache, snr: Int) =
     Actor.immutable[ResourceOp] { (ctx, op) =>
@@ -82,10 +84,10 @@ object ResourceActor {
         case SingleRead(item, replyTo) =>
           // a SingleRead is only served from the cache
           if (cache.contains(item)) {
-            replyTo ! Right(OpReply(item, cache(item)))
+            replyTo ! OpDone(item, cache(item))
             Actor.same
           } else {
-            replyTo ! Left("not cached")
+            replyTo ! OpFailed("not cached")
             Actor.same
           }
 
@@ -117,10 +119,10 @@ object ResourceActor {
         case SingleRead(item, replyTo) =>
           // a SingleRead is only served from the cache
           if (cache.contains(item)) {
-            replyTo ! Right(OpReply(item, cache(item)))
+            replyTo ! OpDone(item, cache(item))
             Actor.same
           } else {
-            replyTo ! Left("not cached")
+            replyTo ! OpFailed("not cached")
             Actor.same
           }
 
@@ -134,15 +136,15 @@ object ResourceActor {
             case Read(item, replyTo) =>
               // permit reads only while not awaiting a result
               if (busy) {
-                replyTo ! Left("must await finish of current operation")
+                replyTo ! OpFailed("must await finish of current operation")
                 Actor.same
               } else if (cache.contains(item)) {
-                replyTo ! Right(OpReply(item, cache(item)))
+                replyTo ! OpDone(item, cache(item))
                 Actor.same
               } else {
                 res.read(item).transform {
-                  case Success(value) => Success(Right(OpReply(item, value)))
-                  case Failure(ex)    => Success(Left(ex.getMessage))
+                  case Success(value) => Success(OpDone(item, value))
+                  case Failure(ex)    => Success(OpFailed(ex.getMessage))
                 }.foreach(v => ctx.self ! Result(v, snr, replyTo))
                 // transition to “busy” mode
                 inSession(res, cache, snr, session, queue, busy = true)
@@ -151,12 +153,12 @@ object ResourceActor {
             case Write(item, value, replyTo) =>
               // permit writes only while not awaiting a result
               if (busy) {
-                replyTo ! Left("must await finish of current operation")
+                replyTo ! OpFailed("must await finish of current operation")
                 Actor.same
               } else {
                 res.write(item, value).transform {
-                  case Success(_)  => Success(Right(OpReply(item, value)))
-                  case Failure(ex) => Success(Left(ex.getMessage))
+                  case Success(_)  => Success(OpDone(item, value))
+                  case Failure(ex) => Success(OpFailed(ex.getMessage))
                 }.foreach(v => ctx.self ! Result(v, snr, replyTo))
                 // transition into “busy” mode
                 inSession(res, cache, snr, session, queue, busy = true)
@@ -182,8 +184,8 @@ object ResourceActor {
             replyTo ! value
             // update the cache when a value is available
             val c = value match {
-              case Left(_)                     => cache
-              case Right(OpReply(item, value)) => cache.updated(item, value)
+              case OpDone(item, value) => cache.updated(item, value)
+              case _                   => cache
             }
             inSession(res, c, snr, session, queue, busy = false)
           } else Actor.same
